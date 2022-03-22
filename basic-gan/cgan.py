@@ -9,6 +9,7 @@ import tensorflow as tf
 # like keras. So I'm importing from keras directly to get rid of red squiggles
 from keras import activations, layers, losses
 from keras.datasets import mnist as dataset_mnist
+from keras.utils.np_utils import to_categorical
 from keras.optimizers import adam_v2 as optimizers  # only get Adam this way :'(
 
 # older/working tensorflow:
@@ -17,7 +18,7 @@ from keras.optimizers import adam_v2 as optimizers  # only get Adam this way :'(
 # cGAN (Conditional Generative Adversarial Network)
 
 
-def get_dataset(batch_size):
+def get_dataset(batch_size, label_dim):
     # don't need test images or labels
     (training_images, training_labels), (_, _) = dataset_mnist.load_data()
     num_images = training_images.shape[0]
@@ -29,11 +30,8 @@ def get_dataset(batch_size):
     training_images = (training_images - (255 / 2)) / (255 / 2)
 
     # concat labels onto end of image
-    training_labels = tf.reshape(
-        tf.one_hot(training_labels, 28), (num_images, 1, 28, 1)
-    )
-
-    training_images = tf.concat([training_images, training_labels], axis=1)
+    training_labels = to_categorical(training_labels, label_dim)[:, :, None, None]
+    training_images = encode_labels(training_images, training_labels)
 
     return (
         tf.data.Dataset.from_tensor_slices(training_images)
@@ -86,12 +84,16 @@ def create_generator(noise_dim, label_dim, leaky_relu_slope=0.3):
     return model, loss
 
 
-def create_discriminator(leaky_relu_slope=0.3, dropout_rate=0.3):
+def create_discriminator(label_dim, leaky_relu_slope=0.3, dropout_rate=0.3):
 
     model = tf.keras.Sequential(
         [
             layers.Conv2D(
-                64, (5, 5), strides=(2, 2), padding="same", input_shape=(29, 28, 1)
+                64,
+                (5, 5),
+                strides=(2, 2),
+                padding="same",
+                input_shape=(28, 28, 1 + label_dim),
             ),
             layers.LeakyReLU(alpha=leaky_relu_slope),
             layers.Dropout(dropout_rate),
@@ -136,14 +138,18 @@ def generate_samples(generator, input, save_file=None):
 
 @tf.function
 def encode_labels(images, labels):
-    return tf.concat(
-        [images, tf.reshape(tf.one_hot(labels, depth=28), (images.shape[0], 1, 28, 1))],
-        axis=1,
+    _, image_width, image_height, _ = images.shape
+    one_hot_labels = tf.reshape(
+        tf.repeat(
+            labels[:, :, None, None], repeats=[image_width * image_height], axis=0
+        ),
+        (-1, image_width, image_height, 10),
     )
+    return tf.concat([images, one_hot_labels], axis=-1)
 
 
 LABEL_DIM = 10
-LABEL_LOGITS = tf.math.log([[0.1] * 10])
+LABEL_LOGITS = tf.math.log([[0.1] * LABEL_DIM])
 NOISE_DIM = 100
 BATCH_SIZE = 256
 EPOCHS = 50
@@ -151,14 +157,15 @@ CHECKPOINT_PERIOD = 5
 
 sample_seed = tf.random.normal([NUM_SAMPLES, NOISE_DIM])
 sample_labels = tf.reshape(
-    tf.one_hot([i % 10 for i in range(NUM_SAMPLES)], depth=10), (NUM_SAMPLES, 10)
+    tf.one_hot([i % LABEL_DIM for i in range(NUM_SAMPLES)], depth=LABEL_DIM),
+    (NUM_SAMPLES, LABEL_DIM),
 )
 sample_seed = tf.concat([sample_seed, sample_labels], axis=1)
 
-training_dataset = get_dataset(BATCH_SIZE)
+training_dataset = get_dataset(BATCH_SIZE, LABEL_DIM)
 
 generator, generator_loss = create_generator(NOISE_DIM, LABEL_DIM)
-discriminator, discriminator_loss = create_discriminator()
+discriminator, discriminator_loss = create_discriminator(LABEL_DIM)
 
 gen_optimizer = optimizers.Adam(1e-4)
 disc_optimizer = optimizers.Adam(1e-4)
@@ -180,17 +187,11 @@ checkpoint = tf.train.Checkpoint(
 @tf.function
 def train_step(real_images):
     noise = tf.random.normal([BATCH_SIZE, NOISE_DIM])
-    labels = tf.random.categorical(LABEL_LOGITS, BATCH_SIZE)
-    inputs = tf.concat(
-        [
-            noise,
-            tf.reshape(
-                tf.one_hot(labels, depth=10),
-                (BATCH_SIZE, 10),
-            ),
-        ],
-        axis=1,
+    labels = tf.reshape(
+        tf.one_hot(tf.random.categorical(LABEL_LOGITS, BATCH_SIZE), depth=LABEL_DIM),
+        (BATCH_SIZE, LABEL_DIM),
     )
+    inputs = tf.concat([noise, labels], axis=1)
 
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
         generated_images = generator(inputs, training=True)
